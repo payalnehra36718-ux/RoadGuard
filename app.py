@@ -1,229 +1,455 @@
+
 import os
 import sqlite3
+import math
 from datetime import datetime
-from math import radians, sin, cos, sqrt, atan2
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 from ultralytics import YOLO
 
-st.set_page_config(page_title="RoadGuard | Road Damage Monitor", page_icon="🛣️", layout="wide")
+
+# ---------------- PAGE SETTINGS ----------------
+
+st.set_page_config(
+    page_title="RoadGuard",
+    page_icon="🛣️",
+    layout="wide"
+)
+
+st.title("🛣️ RoadGuard")
+st.caption("AI-Based Road Damage Detection, Monitoring & Maintenance Prioritisation")
+
+
+# ---------------- DATABASE ----------------
 
 DB_PATH = "roadguard_history.db"
 MODEL_PATH = "best.pt"
 
-SEVERITY_POINTS = {"Minor": 1, "Moderate": 2, "Severe": 3, "Critical": 4}
 
 def connect_db():
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.execute("""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS observations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            defect_key TEXT,
-            observed_at TEXT,
+            date TEXT,
             road_name TEXT,
             latitude REAL,
             longitude REAL,
-            class_name TEXT,
+            defect_class TEXT,
             confidence REAL,
             severity TEXT,
-            bbox_area_pct REAL,
-            status TEXT DEFAULT 'Open'
+            priority REAL
         )
     """)
-    con.commit()
-    return con
+    conn.commit()
+    return conn
 
-def distance_m(lat1, lon1, lat2, lon2):
-    r = 6371000
-    p1, p2 = radians(lat1), radians(lat2)
-    dp = radians(lat2-lat1)
-    dl = radians(lon2-lon1)
-    a = sin(dp/2)**2 + cos(p1)*cos(p2)*sin(dl/2)**2
-    return 2*r*atan2(sqrt(a), sqrt(1-a))
 
+def load_history():
+    conn = connect_db()
+    df = pd.read_sql_query(
+        "SELECT * FROM observations ORDER BY id DESC",
+        conn
+    )
+    conn.close()
+    return df
+
+
+# ---------------- MODEL ----------------
+
+@st.cache_resource
 def get_model():
     if not os.path.exists(MODEL_PATH):
         return None
     return YOLO(MODEL_PATH)
 
-def suggested_severity(area_pct):
-    # Demo heuristic only: bounding-box area is NOT a validated measure of pothole danger.
-    if area_pct >= 20:
+
+# ---------------- LOCATION ----------------
+
+st.sidebar.header("📍 Location")
+
+st.sidebar.caption(
+    "Allow browser location permission to retrieve your GPS coordinates."
+)
+
+if "latitude" not in st.session_state:
+    st.session_state.latitude = 26.8500
+
+if "longitude" not in st.session_state:
+    st.session_state.longitude = 75.7600
+
+if "road_name" not in st.session_state:
+    st.session_state.road_name = ""
+
+
+# Browser GPS component
+location_html = """
+<!DOCTYPE html>
+<html>
+<body style="font-family:Arial">
+<button onclick="getLocation()" style="
+    padding:10px 16px;
+    background:#2563eb;
+    color:white;
+    border:0;
+    border-radius:7px;
+    cursor:pointer;">
+    📍 Get My GPS Location
+</button>
+
+<p id="status" style="font-size:13px"></p>
+
+<script>
+function getLocation() {
+    const status = document.getElementById("status");
+
+    if (!navigator.geolocation) {
+        status.innerText = "Geolocation is not supported.";
+        return;
+    }
+
+    status.innerText = "Getting location...";
+
+    navigator.geolocation.getCurrentPosition(
+        function(position) {
+            const lat = position.coords.latitude;
+            const lon = position.coords.longitude;
+
+            status.innerText =
+                "Latitude: " + lat.toFixed(6) +
+                " | Longitude: " + lon.toFixed(6);
+
+            window.parent.postMessage({
+                type: "roadguard_location",
+                latitude: lat,
+                longitude: lon
+            }, "*");
+        },
+        function(error) {
+            status.innerText =
+                "Location unavailable. Allow location permission or enter coordinates manually.";
+        }
+    );
+}
+</script>
+</body>
+</html>
+"""
+
+components.html(location_html, height=90)
+
+
+# Manual coordinates remain available as a reliable fallback.
+st.sidebar.text_input(
+    "Road name",
+    key="road_name",
+    placeholder="Enter road name"
+)
+
+st.sidebar.number_input(
+    "Latitude",
+    format="%.6f",
+    key="latitude"
+)
+
+st.sidebar.number_input(
+    "Longitude",
+    format="%.6f",
+    key="longitude"
+)
+
+st.sidebar.caption(
+    "Note: GPS button displays coordinates in the browser. "
+    "The fields below are operator-entered unless updated manually."
+)
+
+
+# ---------------- SEVERITY AND PRIORITY ----------------
+
+def suggested_severity(area):
+    if area >= 100000:
         return "Critical"
-    if area_pct >= 10:
+    elif area >= 50000:
         return "Severe"
-    if area_pct >= 3:
+    elif area >= 15000:
         return "Moderate"
     return "Minor"
 
-def nearest_existing(con, lat, lon, radius=25):
-    rows = con.execute(
-        "SELECT defect_key, latitude, longitude FROM observations WHERE latitude IS NOT NULL AND longitude IS NOT NULL"
-    ).fetchall()
-    for key, old_lat, old_lon in rows:
-        if distance_m(lat, lon, old_lat, old_lon) <= radius:
-            return key
-    return None
 
-def priority_score(severity, observation_count):
-    # Proposed prototype score; weights require validation with road-authority data.
-    return min(100, SEVERITY_POINTS[severity] * 15 + min(observation_count, 5) * 8)
+def priority_score(severity, confidence):
+    severity_values = {
+        "Minor": 1,
+        "Moderate": 2,
+        "Severe": 3,
+        "Critical": 4
+    }
 
-st.title("🛣️ RoadGuard")
-st.caption("AI-assisted road damage detection, defect history and maintenance prioritisation — prototype")
+    return round(
+        severity_values.get(severity, 1) * confidence * 25,
+        2
+    )
 
-with st.sidebar:
-    st.header("Project status")
-    st.write("✅ YOLO image detection")
-    st.write("🧪 Severity suggestion (demo heuristic)")
-    st.write("🧪 GPS entered by operator")
-    st.write("🧪 Repeat observations matched by nearby GPS")
-    st.write("🧪 Priority ranking")
-    st.write("🔜 Automated GPS capture / government integration")
-    st.divider()
-    st.caption("This prototype is a decision-support demonstration, not an engineering-grade road safety assessment.")
 
-con = connect_db()
+def distance_m(lat1, lon1, lat2, lon2):
+    R = 6371000
 
-tab1, tab2, tab3 = st.tabs(["1. Detect & record", "2. Priority dashboard", "3. Observation history"])
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(p1) * math.cos(p2)
+        * math.sin(dlon / 2) ** 2
+    )
+
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# ---------------- TABS ----------------
+
+tab1, tab2, tab3 = st.tabs([
+    "🔍 Detect & Record",
+    "📊 Priority Dashboard",
+    "📁 Observation History"
+])
+
+
+# ---------------- TAB 1 ----------------
 
 with tab1:
-    st.subheader("Upload a road image")
-    st.info("The current model returns dataset class IDs. Confirm the class mapping before interpreting a class as a pothole.")
-    uploaded = st.file_uploader("Choose a road image", type=["jpg", "jpeg", "png"])
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        road_name = st.text_input("Road / area name", placeholder="e.g. Mansarovar main road")
-    with c2:
-        latitude = st.number_input("Latitude", value=26.8500, format="%.6f")
-    with c3:
-        longitude = st.number_input("Longitude", value=75.7600, format="%.6f")
 
-    confidence = st.slider("Detection confidence threshold", 0.05, 0.95, 0.25, 0.05)
+    st.header("Road Damage Detection")
 
-    if uploaded:
-        image = Image.open(uploaded).convert("RGB")
-        st.image(image, caption="Uploaded road image", use_container_width=True)
-        if st.button("Analyse image", type="primary"):
+    uploaded_file = st.file_uploader(
+        "Upload a road image",
+        type=["jpg", "jpeg", "png"]
+    )
+
+    confidence_threshold = st.slider(
+        "Detection Confidence",
+        min_value=0.05,
+        max_value=0.95,
+        value=0.10,
+        step=0.05
+    )
+
+    if uploaded_file:
+
+        image = Image.open(uploaded_file).convert("RGB")
+
+        st.image(
+            image,
+            caption="Uploaded Road Image",
+            use_container_width=True
+        )
+
+        if st.button("🚀 Analyse Image", type="primary"):
+
             model = get_model()
+
             if model is None:
-                st.error("Model file best.pt was not found. Put best.pt in the same folder as app.py.")
+                st.error("best.pt is missing. Add best.pt to your GitHub repository.")
             else:
-                with st.spinner("Analysing image..."):
-                    prediction = model.predict(image, conf=confidence, verbose=False)[0]
-                    plotted = prediction.plot()
-                    st.image(plotted, caption="YOLO detections", channels="BGR", use_container_width=True)
-                    names = prediction.names
-                    boxes = prediction.boxes
-                    if boxes is None or len(boxes) == 0:
-                        st.warning("No objects detected at this confidence threshold.")
+                with st.spinner("Analysing road image..."):
+
+                    results = model.predict(
+                        image,
+                        conf=confidence_threshold,
+                        verbose=False
+                    )
+
+                    result = results[0]
+
+                    st.subheader("Detection Result")
+
+                    st.image(
+                        result.plot(),
+                        caption="AI Detection Output",
+                        use_container_width=True
+                    )
+
+                    if result.boxes is None or len(result.boxes) == 0:
+                        st.warning(
+                            "No damage detected. Try a clear road-damage image "
+                            "or a lower confidence threshold."
+                        )
+
                     else:
-                        st.success(f"{len(boxes)} object(s) detected.")
+
                         rows = []
-                        for i, box in enumerate(boxes):
-                            cls_id = int(box.cls.item())
-                            conf = float(box.conf.item())
-                            x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
-                            area_pct = ((x2-x1)*(y2-y1)/(image.width*image.height))*100
-                            suggested = suggested_severity(area_pct)
+
+                        for box in result.boxes:
+
+                            class_id = int(box.cls[0])
+                            confidence = float(box.conf[0])
+
+                            x1, y1, x2, y2 = box.xyxy[0].tolist()
+
+                            area = max(0, x2 - x1) * max(0, y2 - y1)
+
+                            severity = suggested_severity(area)
+
                             rows.append({
-                                "Detection": i+1,
-                                "Class ID": cls_id,
-                                "Class label": str(names.get(cls_id, cls_id)),
-                                "Confidence": round(conf, 3),
-                                "Box area (%)": round(area_pct, 2),
-                                "Suggested severity": suggested
+                                "Class ID": class_id,
+                                "Confidence": round(confidence, 3),
+                                "Bounding Box Area": round(area, 2),
+                                "Suggested Severity": severity
                             })
-                        df = pd.DataFrame(rows)
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-                        st.warning("Severity is only a rough bounding-box-size suggestion. It is not a validated pothole-depth, risk or safety measurement.")
-                        selected = st.selectbox(
-                            "Choose the detection to record",
-                            options=list(range(len(rows))),
-                            format_func=lambda i: f"Detection {i+1} — class {rows[i]['Class ID']} ({rows[i]['Confidence']:.2f})"
+
+                        detection_df = pd.DataFrame(rows)
+
+                        st.dataframe(
+                            detection_df,
+                            use_container_width=True
                         )
-                        suggested_value = rows[selected]["Suggested severity"]
-                        severity = st.selectbox(
-                            "Confirm severity (operator review)",
-                            ["Minor", "Moderate", "Severe", "Critical"],
-                            index=["Minor", "Moderate", "Severe", "Critical"].index(suggested_value)
+
+                        st.info(
+                            "Severity is currently a demo heuristic based on "
+                            "bounding-box area, not a clinically or engineering "
+                            "validated road-condition measurement."
                         )
-                        if st.button("Save this observation"):
-                            existing_key = nearest_existing(con, latitude, longitude)
-                            defect_key = existing_key or f"RG-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                            count_before = con.execute(
-                                "SELECT COUNT(*) FROM observations WHERE defect_key=?", (defect_key,)
-                            ).fetchone()[0]
-                            row = rows[selected]
-                            con.execute("""
-                                INSERT INTO observations
-                                (defect_key, observed_at, road_name, latitude, longitude, class_name,
-                                 confidence, severity, bbox_area_pct, status)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Open')
-                            """, (
-                                defect_key, datetime.now().isoformat(timespec="seconds"),
-                                road_name, latitude, longitude, row["Class label"],
-                                row["Confidence"], severity, row["Box area (%)"]
-                            ))
-                            con.commit()
-                            st.success(
-                                f"Saved as {defect_key}. This is observation #{count_before+1} "
-                                f"for the matched location."
+
+                        st.subheader("Save Observation")
+
+                        selected_index = st.selectbox(
+                            "Select detected defect",
+                            range(len(rows)),
+                            format_func=lambda x: (
+                                f"Detection {x + 1} — "
+                                f"Class {rows[x]['Class ID']}"
                             )
+                        )
+
+                        selected = rows[selected_index]
+
+                        severity = st.selectbox(
+                            "Confirm severity",
+                            ["Minor", "Moderate", "Severe", "Critical"],
+                            index=[
+                                "Minor", "Moderate", "Severe", "Critical"
+                            ].index(selected["Suggested Severity"])
+                        )
+
+                        road_name = st.session_state.road_name.strip()
+                        latitude = st.session_state.latitude
+                        longitude = st.session_state.longitude
+
+                        priority = priority_score(
+                            severity,
+                            selected["Confidence"]
+                        )
+
+                        st.metric("Maintenance Priority Score", priority)
+
+                        if st.button("💾 Save Observation"):
+
+                            if not road_name:
+                                st.error("Please enter the road name.")
+                            else:
+                                conn = connect_db()
+
+                                conn.execute("""
+                                    INSERT INTO observations
+                                    (date, road_name, latitude, longitude,
+                                     defect_class, confidence, severity, priority)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                """, (
+                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    road_name,
+                                    latitude,
+                                    longitude,
+                                    str(selected["Class ID"]),
+                                    selected["Confidence"],
+                                    severity,
+                                    priority
+                                ))
+
+                                conn.commit()
+                                conn.close()
+
+                                st.success("Observation saved successfully!")
+
+
+# ---------------- TAB 2 ----------------
 
 with tab2:
-    st.subheader("Which road defects need attention first?")
-    df = pd.read_sql_query("SELECT * FROM observations", con)
-    if df.empty:
-        st.info("No observations recorded yet. Upload an image and save a detection in the first tab.")
+
+    st.header("Maintenance Priority Dashboard")
+
+    history = load_history()
+
+    if history.empty:
+        st.info("No observations recorded yet.")
+
     else:
-        counts = df.groupby("defect_key").size().rename("Observation count")
-        latest = df.sort_values("observed_at").groupby("defect_key").tail(1).copy()
-        latest = latest.merge(counts, on="defect_key")
-        latest["Priority score"] = latest.apply(
-            lambda r: priority_score(r["severity"], int(r["Observation count"])), axis=1
+
+        col1, col2, col3 = st.columns(3)
+
+        col1.metric("Total Observations", len(history))
+        col2.metric("Severe / Critical", len(
+            history[history["severity"].isin(["Severe", "Critical"])]
+        ))
+        col3.metric(
+            "Average Priority",
+            round(history["priority"].mean(), 2)
         )
-        latest["Priority"] = latest["Priority score"].apply(
-            lambda x: "Critical" if x >= 75 else ("High" if x >= 55 else ("Medium" if x >= 35 else "Low"))
+
+        st.subheader("Highest Priority Defects")
+
+        dashboard = history.sort_values(
+            "priority",
+            ascending=False
         )
-        latest = latest.sort_values("Priority score", ascending=False)
-        st.caption("Prototype ranking: severity + repeat-observation count. Score weights are proposed and need validation.")
+
         st.dataframe(
-            latest[["defect_key", "road_name", "severity", "Observation count",
-                    "Priority", "Priority score", "observed_at", "status"]],
-            use_container_width=True, hide_index=True
+            dashboard,
+            use_container_width=True
         )
-        st.metric("Unique tracked locations", latest["defect_key"].nunique())
-        st.metric("Open observations", int((df["status"] == "Open").sum()))
-        st.download_button(
-            "Download priority report (CSV)",
-            latest.to_csv(index=False).encode("utf-8"),
-            file_name="roadguard_priority_report.csv",
-            mime="text/csv"
+
+        st.bar_chart(
+            dashboard.set_index("road_name")["priority"]
         )
+
+
+# ---------------- TAB 3 ----------------
 
 with tab3:
-    st.subheader("Repeated observations / defect history")
-    history = pd.read_sql_query(
-        "SELECT * FROM observations ORDER BY observed_at DESC", con
-    )
+
+    st.header("Observation History")
+
+    history = load_history()
+
     if history.empty:
         st.info("No saved observations yet.")
+
     else:
-        selected_key = st.selectbox("Select a tracked defect", sorted(history["defect_key"].unique()))
         st.dataframe(
-            history[history["defect_key"] == selected_key],
-            use_container_width=True, hide_index=True
+            history,
+            use_container_width=True
         )
-        st.caption("Nearby GPS points within 25 metres are grouped as the same defect in this prototype. This matching radius needs field testing.")
+
+        csv = history.to_csv(index=False).encode("utf-8")
+
         st.download_button(
-            "Download full observation history (CSV)",
-            history.to_csv(index=False).encode("utf-8"),
-            file_name="roadguard_observation_history.csv",
+            "⬇️ Download Observation History",
+            data=csv,
+            file_name="roadguard_observations.csv",
             mime="text/csv"
         )
 
+
+# ---------------- FOOTER ----------------
+
 st.divider()
-st.caption("RoadGuard prototype | Detection model: YOLOv8n | Human review required before maintenance decisions.")
+
+st.caption(
+    "RoadGuard | AI-assisted road monitoring prototype | "
+    "GPS and road details require verification."
+)
+
